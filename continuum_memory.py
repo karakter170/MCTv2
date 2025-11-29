@@ -8,6 +8,7 @@
 import numpy as np
 from numpy.linalg import norm
 import time
+import threading
 from dataclasses import dataclass, field
 from typing import Optional, List, Tuple, Dict
 from enum import Enum
@@ -27,8 +28,10 @@ except ImportError:
 # GLOBAL CACHE FOR GATING HANDLER (Performance Optimization)
 # =============================================================================
 # Bu cache sayesinde model her track güncellemesinde diskten tekrar okunmaz.
+# FIXED: Added thread-safe lock for singleton pattern
 _SHARED_GATING_HANDLER = None
 _SHARED_HANDLER_PATH = None
+_GATING_HANDLER_LOCK = threading.Lock()
 
 
 # =============================================================================
@@ -141,32 +144,35 @@ class ContinuumStateV2:
             
     def _get_shared_gating_module(self):
         """
-        Retrieves or creates the shared gating handler to avoid reloading 
+        Retrieves or creates the shared gating handler to avoid reloading
         the model from disk for every single track object.
+        FIXED: Thread-safe singleton pattern with lock.
         """
         global _SHARED_GATING_HANDLER, _SHARED_HANDLER_PATH
-        
+
         if not self.config.use_learned_gating or not LEARNED_GATING_AVAILABLE:
             return None
-            
+
         path = self.config.gating_model_path
-        
-        # If already loaded and path hasn't changed, return cached instance
-        if _SHARED_GATING_HANDLER is not None and _SHARED_HANDLER_PATH == path:
-            return _SHARED_GATING_HANDLER
-            
-        # Otherwise, load it (only happens once per process usually)
-        try:
-            handler = LearnedGating(
-                model_path=path,
-                fallback_threshold=self.config.stability_thresh
-            )
-            _SHARED_GATING_HANDLER = handler
-            _SHARED_HANDLER_PATH = path
-            return handler
-        except Exception as e:
-            print(f"[ContinuumV2] Failed to init LearnedGating: {e}")
-            return None
+
+        # Thread-safe singleton check
+        with _GATING_HANDLER_LOCK:
+            # Double-check pattern: verify again inside lock
+            if _SHARED_GATING_HANDLER is not None and _SHARED_HANDLER_PATH == path:
+                return _SHARED_GATING_HANDLER
+
+            # Load model (only happens once per process)
+            try:
+                handler = LearnedGating(
+                    model_path=path,
+                    fallback_threshold=self.config.stability_thresh
+                )
+                _SHARED_GATING_HANDLER = handler
+                _SHARED_HANDLER_PATH = path
+                return handler
+            except Exception as e:
+                print(f"[ContinuumV2] Failed to init LearnedGating: {e}")
+                return None
     
     def _initialize_fresh(self):
         self.fast_buffer: List[BufferEntry] = []
@@ -335,8 +341,18 @@ class ContinuumStateV2:
     def _prune_weak_modes(self):
         if len(self.modes) <= 1: return
         self.modes = [m for m in self.modes if m.weight >= self.config.mode_min_weight]
-        if not self.modes and self.primary_mean is not None:
-             self._create_mode(self.primary_mean, time.time(), 1.0)
+
+        # FIXED: Safe recovery when all modes are pruned
+        if not self.modes:
+            if self.primary_mean is not None:
+                # Restore from primary mean
+                self._create_mode(self.primary_mean, time.time(), 1.0)
+            elif self.fast_buffer:
+                # Fallback: recreate from fast buffer centroid
+                centroid, _ = self._compute_weighted_centroid(time.time())
+                if centroid is not None:
+                    self._create_mode(centroid, time.time(), 1.0)
+                    print("[ContinuumV2] WARNING: All modes pruned, recreated from buffer")
     
     def _normalize_mode_weights(self):
         if not self.modes: return
@@ -380,16 +396,23 @@ class ContinuumStateV2:
     def _execute_breakout(self, current_time: float):
         if not self.breakout_candidate: return
         new_feat = self.breakout_candidate.feature
-        
+
         best_idx, best_sim = self._find_best_mode(new_feat)
-        
+
         if best_sim > self.config.mode_creation_thresh:
              self._update_mode(best_idx, new_feat, 0.5, current_time)
         elif len(self.modes) < self.config.max_modes:
              self._create_mode(new_feat, current_time, 0.4)
         else:
+             # FIXED: Normalize feature and use named arguments for clarity
              weakest = min(range(len(self.modes)), key=lambda i: self.modes[i].weight)
-             self.modes[weakest] = AppearanceMode(new_feat, np.ones(self.feature_dim)*0.05, 0.4, 1, current_time)
+             self.modes[weakest] = AppearanceMode(
+                 mean=self._normalize(new_feat),
+                 variance=np.ones(self.feature_dim, dtype=np.float32) * 0.05,
+                 weight=0.4,
+                 count=1,
+                 last_update=current_time
+             )
         
         self.breakout_candidate = None
         self.divergence_counter = 0
@@ -446,7 +469,7 @@ class ContinuumStateV2:
         if self.gating_module and target_mode and LEARNED_GATING_AVAILABLE:
             # Prepare fast buffer list for context
             buffer_list = [e.feature for e in self.fast_buffer]
-            
+
             # Use imported extractor function
             try:
                 context = extract_gating_context(
@@ -465,13 +488,15 @@ class ContinuumStateV2:
                     maturity_frames=self.config.maturity_frames,
                     breakout_limit=self.config.breakout_limit
                 )
-                
+
                 # Predict using the module
                 modulation = self.gating_module.compute_update_weight(context)
                 gating_source = "learned_network"
-                
-            except Exception as e:
-                # Silent fail to fallback to keep logs clean
+
+            except (ValueError, RuntimeError, AttributeError, TypeError) as e:
+                # FIXED: Catch specific exceptions, log periodically to avoid spam
+                if self.count % 100 == 0:
+                    print(f"[ContinuumV2] Gating network failed (count={self.count}): {e}, using sigmoid fallback")
                 modulation = 1.0 / (1.0 + np.exp(-self.config.sigmoid_scale * (consistency - self.config.stability_thresh)))
         else:
             # Fallback if module not loaded

@@ -114,16 +114,16 @@ class GatingNetworkWithUncertainty(nn.Module):
             nn.Sigmoid()
         )
     
-    def forward(self, x: torch.Tensor, return_uncertainty: bool = False, 
+    def forward(self, x: torch.Tensor, return_uncertainty: bool = False,
                 n_samples: int = 10) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Forward pass with optional uncertainty estimation.
-        
+
         Args:
             x: Context features
             return_uncertainty: Whether to compute uncertainty via MC Dropout
             n_samples: Number of forward passes for uncertainty
-            
+
         Returns:
             (mean_prediction, uncertainty) if return_uncertainty else (prediction, None)
         """
@@ -132,24 +132,28 @@ class GatingNetworkWithUncertainty(nn.Module):
             for layer in self.hidden_layers:
                 h = layer(h)
             return self.output_layer(h), None
-        
+
         # Monte Carlo Dropout for uncertainty
+        # FIXED: Preserve original training mode
+        original_mode = self.training
         self.train()  # Enable dropout
+
         predictions = []
-        
+
         for _ in range(n_samples):
             h = self.input_layer(x)
             for layer in self.hidden_layers:
                 h = layer(h)
             pred = self.output_layer(h)
             predictions.append(pred)
-        
+
         predictions = torch.stack(predictions, dim=0)
         mean_pred = predictions.mean(dim=0)
         uncertainty = predictions.std(dim=0)
-        
-        self.eval()  # Disable dropout for subsequent calls
-        
+
+        # Restore original mode instead of forcing eval
+        self.train(original_mode)
+
         return mean_pred, uncertainty
 
 
@@ -651,12 +655,19 @@ class GatingNetworkTrainer:
             )
         
         # Compute class weights for imbalance
+        # FIXED: Correct class weight calculation (higher weight for minority class)
         labels = train_dataset.labels.numpy().flatten()
-        pos_ratio = np.mean(labels > 0.5)
-        neg_weight = pos_ratio
-        pos_weight = 1 - pos_ratio
+        n_samples = len(labels)
+        n_pos = np.sum(labels > 0.5)
+        n_neg = n_samples - n_pos
+
+        # Weight inversely proportional to class frequency
+        pos_weight = n_samples / (2.0 * n_pos + 1e-8)
+        neg_weight = n_samples / (2.0 * n_neg + 1e-8)
+
         class_weights = (neg_weight, pos_weight)
         print(f"[Training] Class weights: neg={neg_weight:.3f}, pos={pos_weight:.3f}")
+        print(f"[Training] Class distribution: pos={n_pos}/{n_samples} ({n_pos/n_samples*100:.1f}%), neg={n_neg}/{n_samples} ({n_neg/n_samples*100:.1f}%)")
         
         history = {
             'train_loss': [],
