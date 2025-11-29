@@ -32,15 +32,13 @@ from sklearn.preprocessing import StandardScaler
 @dataclass
 class MSMT17Config:
     """Configuration for MSMT17 training."""
-
-    # Dataset paths - configurable via environment variables or direct setting
-    # Set MSMT17_DATASET_ROOT and DINOV3_WEIGHTS_PATH environment variables
-    # or update these defaults before training
-    dataset_root: str = os.getenv('MSMT17_DATASET_ROOT', './data/MSMT17_V1')
-
-    # DINOv3 pretrained weights path
-    pretrained_weights_path: str = os.getenv('DINOV3_WEIGHTS_PATH', './models/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth')
-
+    
+    # Dataset paths (Update these if needed)
+    dataset_root: str = r"C:\Users\metev\OneDrive\Desktop\CmptVsn\Pose Olmadan Son Model\SonProje-v7-Dino\models\Dino\MSMT17_V1"
+    
+    # Local weights path
+    pretrained_weights_path: str = r"C:\Users\metev\OneDrive\Desktop\CmptVsn\Pose Olmadan Son Model\SonProje-v7-Dino\models\Dino\dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
+    
     feature_extractor: str = "dinov3_vitl16"
     feature_dim: int = 1024
     batch_size_extraction: int = 64 # Increased for speed
@@ -169,13 +167,8 @@ class FeatureExtractor:
 
             batch = self.preprocess(images)
             if batch is not None:
-                # Mixed Precision (autocast) for speedup and memory savings
-                # Only use CUDA autocast if CUDA is available
-                if self.device == 'cuda':
-                    with torch.cuda.amp.autocast():
-                        features = self.model(batch)
-                        features = F.normalize(features, p=2, dim=1)
-                else:
+                # Mixed Precision (autocast) kullanarak hızlandır ve VRAM tasarrufu yap
+                with torch.cuda.amp.autocast():
                     features = self.model(batch)
                     features = F.normalize(features, p=2, dim=1)
                 all_features.append(features.cpu().numpy())
@@ -284,23 +277,19 @@ class DataGenerator:
 
         print("Extracting features...")
         paths = []
-        path_to_pid = {}  # FIXED: O(1) lookup instead of O(N*M)
-
-        # Build path list and mapping in single pass
         for pid, imgs in self.dataset.data.items():
-            for img in imgs:
-                path = img['path']
-                paths.append(path)
-                path_to_pid[path] = pid
-
+            for img in imgs: paths.append(img['path'])
+        
         feats_arr = self.extractor.extract_from_paths(paths)
-
-        # Use efficient dict lookup instead of nested loops
+        
         for i, path in enumerate(paths):
             self.feats[path] = feats_arr[i]
-            pid = path_to_pid[path]  # O(1) lookup
-            self.id_feats[pid].append(feats_arr[i])
-
+            # Reverse lookup for ID
+            for pid, imgs in self.dataset.data.items():
+                if any(x['path'] == path for x in imgs):
+                    self.id_feats[pid].append(feats_arr[i])
+                    break
+                    
         with open(cache_path, 'wb') as f:
             pickle.dump({'feats': self.feats, 'id_feats': self.id_feats}, f)
 
@@ -368,31 +357,27 @@ class DataGenerator:
 # =============================================================================
 
 class GatingNetwork(nn.Module):
-    def __init__(self, input_dim=12, hidden_dims=None):
+    def __init__(self, input_dim=12):
         super().__init__()
-        # CRITICAL: Must match learned_gating.py architecture exactly
-        # for trained weights to be compatible with inference
-        if hidden_dims is None:
-            hidden_dims = [32, 16]
-
-        layers = []
-        prev_dim = input_dim
-
-        for hidden_dim in hidden_dims:
-            layers.extend([
-                nn.Linear(prev_dim, hidden_dim),
-                nn.LayerNorm(hidden_dim),  # LayerNorm (not BatchNorm!)
-                nn.ReLU(),
-                nn.Dropout(0.1)  # Consistent 0.1 dropout
-            ])
-            prev_dim = hidden_dim
-
-        # Output layer with Sigmoid (part of the model architecture)
-        layers.append(nn.Linear(prev_dim, 1))
-        layers.append(nn.Sigmoid())
-
-        self.net = nn.Sequential(*layers)
-
+        # Wider and deeper for better decision boundaries
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 64),
+            nn.BatchNorm1d(64), # Added Batch Norm
+            nn.ReLU(),
+            nn.Dropout(0.2),    # Moderate dropout
+            
+            nn.Linear(64, 32),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            
+            nn.Linear(32, 16),
+            nn.BatchNorm1d(16),
+            nn.ReLU(),
+            
+            nn.Linear(16, 1)    # No Sigmoid here, we use BCEWithLogitsLoss
+        )
+        
     def forward(self, x):
         return self.net(x)
 
@@ -426,9 +411,9 @@ class Trainer:
         val_loader = DataLoader(val_set, batch_size=self.config.batch_size)
         
         # 3. Setup Optimization
-        # Use BCELoss since Sigmoid is built into the model architecture
-        criterion = nn.BCELoss()
-        optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.config.learning_rate, weight_decay=self.config.weight_decay)
+        # BCEWithLogitsLoss is more stable than BCELoss + Sigmoid
+        criterion = nn.BCEWithLogitsLoss() 
+        optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.config.learning_rate, weight_decay=1e-3)
         
         # Scheduler for better convergence
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
@@ -457,11 +442,11 @@ class Trainer:
             with torch.no_grad():
                 for bx, by in val_loader:
                     bx, by = bx.to(self.device), by.to(self.device)
-                    probs = self.model(bx)  # Already includes sigmoid
-                    loss = criterion(probs, by)
+                    logits = self.model(bx)
+                    loss = criterion(logits, by)
                     val_loss += loss.item()
-
-                    preds = (probs > 0.5).float()  # No sigmoid needed
+                    
+                    preds = (torch.sigmoid(logits) > 0.5).float()
                     correct += (preds == by).sum().item()
             
             acc = correct / len(val_set)
@@ -473,16 +458,16 @@ class Trainer:
             
             if acc > best_acc:
                 best_acc = acc
-                # Save model state dict directly (architecture already includes sigmoid)
+                # Save model with architecture that includes sigmoid for inference
                 self.save_inference_model()
-
+                
     def save_inference_model(self):
-        # Save the model's state_dict directly
-        # The model architecture already includes Sigmoid, so no wrapper needed
-        # This format is compatible with learned_gating.py loading
-        os.makedirs(os.path.dirname(self.config.model_save_path), exist_ok=True)
-        torch.save(self.model.state_dict(), self.config.model_save_path)
-        print(f"[Trainer] Model saved to {self.config.model_save_path}")
+        # Create a sequential model that includes Sigmoid for easier inference loading
+        inference_model = nn.Sequential(
+            self.model.net,
+            nn.Sigmoid()
+        )
+        torch.save(inference_model.state_dict(), self.config.model_save_path)
 
 
 # =============================================================================
