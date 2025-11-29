@@ -12,31 +12,54 @@ import redis
 import json
 import time
 import numpy as np
-import csv 
+import csv
 import threading
 import queue
 import signal
 import sys
 from typing import Optional
+from dataclasses import dataclass
 
-from tracker_MCT import TrackerManagerMCT 
+from tracker_MCT import TrackerManagerMCT
 from topology_manager import TopologyManager
 from continuum_memory import ContinuumStateV2, ContinuumConfig
 
-# --- CONFIG ---
-PUBLIC_CSV = 'MCT_Public_Log.csv'
-SECRET_CSV = 'MCT_Shadow_Log_SECRET.csv'
+# ============================================
+# Service Configuration
+# ============================================
+@dataclass
+class ServiceConfig:
+    """Centralized configuration for the tracking service."""
+    # CSV Logging
+    public_csv: str = 'MCT_Public_Log.csv'
+    secret_csv: str = 'MCT_Shadow_Log_SECRET.csv'
+    csv_batch_size: int = 50
 
-# ============================================
-# Redis Streams Configuration
-# ============================================
-STREAM_NAME = "track_events"           
-CONSUMER_GROUP = "mct_processors"      
-CONSUMER_NAME = f"processor_{int(time.time())}"
-BATCH_SIZE = 100                        
-BLOCK_MS = 1000                        
-MAX_RETRIES = 3                        
-DEAD_LETTER_STREAM = "track_events_dlq"
+    # Redis Streams
+    stream_name: str = "track_events"
+    consumer_group: str = "mct_processors"
+    dead_letter_stream: str = "track_events_dlq"
+    batch_size: int = 100
+    block_ms: int = 1000
+    max_retries: int = 3
+
+    # Timeouts (milliseconds)
+    message_timeout_ms: int = 30000  # 30 seconds
+    retry_cleanup_interval: int = 600  # 10 minutes
+
+    # Cache Settings
+    local_cache_ttl: float = 5.0  # seconds
+    redis_cache_ttl: int = 3600  # 1 hour
+    cache_cleanup_interval: float = 60.0  # 1 minute
+
+    # Metrics
+    metrics_log_interval: int = 100  # Log every N updates
+
+    def get_consumer_name(self) -> str:
+        """Generate unique consumer name."""
+        return f"processor_{int(time.time())}"
+
+SERVICE_CONFIG = ServiceConfig()
 
 # ============================================
 # Nested Learning Configuration
@@ -44,10 +67,9 @@ DEAD_LETTER_STREAM = "track_events_dlq"
 CONTINUUM_CONFIG = ContinuumConfig(
     buffer_size=7,
 
-    # --- YENİ EKLENEN KISIM ---
-    use_learned_gating=True,  # Yapay Zeka kararını aktif et
-    gating_model_path="models/gating_network_msmt17.pt", # Eğittiğiniz modelin yolu
-    # --------------------------
+    # Learned Gating (Neural Network)
+    use_learned_gating=True,
+    gating_model_path="models/gating_network_msmt17.pt",
 
     alpha_slow_base=0.05,
     alpha_slow_min=0.02,
@@ -61,18 +83,18 @@ CONTINUUM_CONFIG = ContinuumConfig(
     maturity_frames=100,
     min_quality_for_update=0.3
 )
-
-# Cache TTL for continuum states in Redis (1 hour)
-CONTINUUM_CACHE_TTL = 3600
 # ============================================
 
 
 class BatchCSVWriter:
-    def __init__(self, filename, headers):
+    """Thread-safe CSV writer with batching for performance."""
+
+    def __init__(self, filename, headers, batch_size=None):
         self.filename = filename
         self.headers = headers
+        self.batch_size = batch_size or SERVICE_CONFIG.csv_batch_size
         self.queue = queue.Queue()
-        self.thread = threading.Thread(target=self._worker, daemon=True)
+        self.thread = threading.Thread(target=self._worker, daemon=False)  # Non-daemon for graceful shutdown
         self.file = None
         self.writer = None
         self._running = True
@@ -101,126 +123,148 @@ class BatchCSVWriter:
                 if item is None:
                     break
                 batch.append(item)
-                if len(batch) >= 50 or self.queue.empty():
+                if len(batch) >= self.batch_size or self.queue.empty():
                     if self.writer:
                         self.writer.writerows(batch)
+                        self.file.flush()  # Ensure data is written
                     batch = []
             except queue.Empty:
                 if batch and self.writer:
                     self.writer.writerows(batch)
+                    self.file.flush()
                     batch = []
+            except (IOError, OSError) as e:
+                print(f"[CSVWriter] I/O Error: {e}")
             except Exception as e:
-                print(f"[CSVWriter] Error: {e}")
+                print(f"[CSVWriter] Unexpected error: {e}")
+                import traceback
+                traceback.print_exc()
 
 
 class NestedLearningManager:
     """
     Manages ContinuumStateV2 instances for all tracked identities.
     Handles Redis persistence and provides statistics.
+
+    THREAD-SAFE: All cache and stats operations are protected by locks.
     """
-    
+
     def __init__(self, redis_client, config: ContinuumConfig = None):
         self.redis = redis_client
         self.config = config or CONTINUUM_CONFIG
-        
-        # Local cache to reduce Redis calls
+
+        # FIXED: Thread-safe local cache with locks
         self.local_cache = {}
         self.cache_timestamps = {}
-        self.cache_ttl = 5.0  # Local cache TTL in seconds
-        
-        # Statistics
+        self.cache_ttl = SERVICE_CONFIG.local_cache_ttl
+        self._cache_lock = threading.RLock()  # Reentrant lock for nested calls
+
+        # FIXED: Thread-safe statistics
         self.stats = {
             'updates': 0,
             'cache_hits': 0,
             'cache_misses': 0,
             'breakouts': 0,
-            'new_modes': 0
+            'new_modes': 0,
+            'errors': 0
         }
+        self._stats_lock = threading.Lock()
     
     def _get_key(self, global_id: int) -> str:
         """Get Redis key for a global ID."""
         return f"mct:continuum:v2:{global_id}"
     
     def _load_state(self, global_id: int) -> ContinuumStateV2:
-        """Load state from Redis or create new one."""
+        """Load state from Redis or create new one. THREAD-SAFE."""
         current_time = time.time()
-        
-        # Check local cache first
-        if global_id in self.local_cache:
-            cache_age = current_time - self.cache_timestamps.get(global_id, 0)
-            if cache_age < self.cache_ttl:
-                self.stats['cache_hits'] += 1
-                return self.local_cache[global_id]
-        
-        self.stats['cache_misses'] += 1
-        
-        # Load from Redis
-        key = self._get_key(global_id)
-        raw_data = self.redis.get(key)
-        
-        if raw_data:
-            try:
-                data = json.loads(raw_data)
-                cms = ContinuumStateV2(data=data, config=self.config)
-            except (json.JSONDecodeError, Exception) as e:
-                print(f"[NestedLearning] Error loading state for {global_id}: {e}")
+
+        # FIXED: Thread-safe cache access
+        with self._cache_lock:
+            # Check local cache first
+            if global_id in self.local_cache:
+                cache_age = current_time - self.cache_timestamps.get(global_id, 0)
+                if cache_age < self.cache_ttl:
+                    with self._stats_lock:
+                        self.stats['cache_hits'] += 1
+                    return self.local_cache[global_id]
+
+            with self._stats_lock:
+                self.stats['cache_misses'] += 1
+
+            # Load from Redis
+            key = self._get_key(global_id)
+            raw_data = self.redis.get(key)
+
+            if raw_data:
+                try:
+                    data = json.loads(raw_data)
+                    cms = ContinuumStateV2(data=data, config=self.config)
+                except (json.JSONDecodeError, ValueError, KeyError, TypeError) as e:
+                    print(f"[NestedLearning] Error loading state for {global_id}: {e}")
+                    cms = ContinuumStateV2(config=self.config)
+                    with self._stats_lock:
+                        self.stats['errors'] += 1
+            else:
                 cms = ContinuumStateV2(config=self.config)
-        else:
-            cms = ContinuumStateV2(config=self.config)
-        
-        # Update local cache
-        self.local_cache[global_id] = cms
-        self.cache_timestamps[global_id] = current_time
-        
-        return cms
+
+            # Update local cache
+            self.local_cache[global_id] = cms
+            self.cache_timestamps[global_id] = current_time
+
+            return cms
     
     def _save_state(self, global_id: int, cms: ContinuumStateV2):
-        """Save state to Redis."""
+        """Save state to Redis. THREAD-SAFE."""
         key = self._get_key(global_id)
         data = cms.to_dict()
-        self.redis.set(key, json.dumps(data), ex=CONTINUUM_CACHE_TTL)
-        
-        # Update local cache
-        self.local_cache[global_id] = cms
-        self.cache_timestamps[global_id] = time.time()
+        self.redis.set(key, json.dumps(data), ex=SERVICE_CONFIG.redis_cache_ttl)
+
+        # FIXED: Thread-safe cache update
+        with self._cache_lock:
+            self.local_cache[global_id] = cms
+            self.cache_timestamps[global_id] = time.time()
     
     def update(self, global_id: int, feature: np.ndarray, quality: float = 1.0) -> dict:
         """
         Update the nested learning state for a global ID.
-        
+
         Args:
             global_id: Global track ID
             feature: Feature vector from DINOv2
-            quality: Quality score (0-1)
-            
+            quality: Quality score (0-1), clamped to [0, 1]
+
         Returns:
             Dictionary with update results and identity information
         """
+        # FIXED: Validate and clamp quality score
+        quality = max(0.0, min(1.0, quality))
+
         # Load current state
         cms = self._load_state(global_id)
-        
+
         # Track modes before update
         modes_before = len(cms.modes)
         divergence_before = cms.divergence_counter
-        
+
         # Perform learning step
         learn_result = cms.learn(feature, quality=quality)
-        
-        # Track statistics
-        self.stats['updates'] += 1
-        
-        if len(cms.modes) > modes_before:
-            self.stats['new_modes'] += 1
-        
-        if divergence_before > cms.config.breakout_limit and cms.divergence_counter == 0:
-            self.stats['breakouts'] += 1
-        
+
+        # FIXED: Thread-safe statistics update
+        with self._stats_lock:
+            self.stats['updates'] += 1
+
+            if len(cms.modes) > modes_before:
+                self.stats['new_modes'] += 1
+
+            if divergence_before > cms.config.breakout_limit and cms.divergence_counter == 0:
+                self.stats['breakouts'] += 1
+
         # Save updated state
         self._save_state(global_id, cms)
-        
+
         # Get identity information
         identity = cms.get_identity()
-        
+
         return {
             'learn_result': learn_result,
             'identity': identity,
@@ -250,22 +294,33 @@ class NestedLearningManager:
         return cms.get_statistics()
     
     def get_manager_stats(self) -> dict:
-        """Get overall manager statistics."""
-        return {
-            **self.stats,
-            'cached_identities': len(self.local_cache)
-        }
-    
-    def cleanup_cache(self, max_age: float = 60.0):
-        """Remove old entries from local cache."""
+        """Get overall manager statistics. THREAD-SAFE."""
+        with self._stats_lock:
+            stats_copy = self.stats.copy()
+
+        with self._cache_lock:
+            stats_copy['cached_identities'] = len(self.local_cache)
+
+        return stats_copy
+
+    def cleanup_cache(self, max_age: float = None):
+        """Remove old entries from local cache. THREAD-SAFE."""
+        if max_age is None:
+            max_age = SERVICE_CONFIG.cache_cleanup_interval
+
         current_time = time.time()
-        expired = [
-            gid for gid, ts in self.cache_timestamps.items()
-            if current_time - ts > max_age
-        ]
-        for gid in expired:
-            self.local_cache.pop(gid, None)
-            self.cache_timestamps.pop(gid, None)
+
+        with self._cache_lock:
+            expired = [
+                gid for gid, ts in self.cache_timestamps.items()
+                if current_time - ts > max_age
+            ]
+            for gid in expired:
+                self.local_cache.pop(gid, None)
+                self.cache_timestamps.pop(gid, None)
+
+        if expired:
+            print(f"[NestedLearning] Cleaned up {len(expired)} expired cache entries")
 
 
 # --- SETUP ---
@@ -288,8 +343,14 @@ tracker = TrackerManagerMCT(
 nested_learning = NestedLearningManager(r_json, CONTINUUM_CONFIG)
 print(f"[Central] Nested Learning Config: {CONTINUUM_CONFIG}")
 
-public_log = BatchCSVWriter(PUBLIC_CSV, ['Time', 'Group', 'Cam', 'GID', 'Event', 'X', 'Y'])
-secret_log = BatchCSVWriter(SECRET_CSV, ['Time', 'Group', 'Cam', 'GID', 'Event', 'X', 'Y', 'Role', 'Name'])
+public_log = BatchCSVWriter(
+    SERVICE_CONFIG.public_csv,
+    ['Time', 'Group', 'Cam', 'GID', 'Event', 'X', 'Y']
+)
+secret_log = BatchCSVWriter(
+    SERVICE_CONFIG.secret_csv,
+    ['Time', 'Group', 'Cam', 'GID', 'Event', 'X', 'Y', 'Role', 'Name']
+)
 public_log.start()
 secret_log.start()
 
@@ -298,21 +359,23 @@ secret_log.start()
 # Stream Setup Functions
 # ============================================
 def setup_stream():
+    """Initialize Redis Stream consumer group."""
     try:
         r_json.xgroup_create(
-            name=STREAM_NAME,
-            groupname=CONSUMER_GROUP,
+            name=SERVICE_CONFIG.stream_name,
+            groupname=SERVICE_CONFIG.consumer_group,
             id='0',
             mkstream=True
         )
-        print(f"[Stream] Created consumer group '{CONSUMER_GROUP}'")
+        print(f"[Stream] Created consumer group '{SERVICE_CONFIG.consumer_group}'")
     except redis.ResponseError as e:
         if "BUSYGROUP" in str(e):
-            print(f"[Stream] Consumer group '{CONSUMER_GROUP}' already exists")
+            print(f"[Stream] Consumer group '{SERVICE_CONFIG.consumer_group}' already exists")
         else:
             raise
 
 def migrate_from_pubsub():
+    """Bridge from legacy pub/sub to Redis Streams."""
     def bridge_worker():
         pubsub = r_json.pubsub()
         pubsub.subscribe("track_event_stream")
@@ -320,8 +383,12 @@ def migrate_from_pubsub():
         for msg in pubsub.listen():
             if msg['type'] == 'message':
                 try:
-                    r_json.xadd(STREAM_NAME, {'data': msg['data']}, maxlen=100000)
-                except Exception as e:
+                    r_json.xadd(
+                        SERVICE_CONFIG.stream_name,
+                        {'data': msg['data']},
+                        maxlen=100000
+                    )
+                except (redis.RedisError, redis.ConnectionError) as e:
                     print(f"[Migration] Bridge error: {e}")
     thread = threading.Thread(target=bridge_worker, daemon=True)
     thread.start()
@@ -332,6 +399,8 @@ def handle_event(data, message_id=None):
     """
     Process a single track event.
     Includes Enhanced Nested Learning with multi-modal support.
+
+    IMPROVED: Better exception handling and quality validation.
     """
     try:
         cam = data['camera_id']
@@ -340,7 +409,10 @@ def handle_event(data, message_id=None):
         eid = data['edge_track_id']
         gp = np.array(data['gp_coord']) if data['gp_coord'] else None
         feat = np.array(data['feature']) if data.get('feature') else None
-        quality = data.get('quality', 1.0) 
+
+        # FIXED: Validate quality score
+        quality = data.get('quality', 1.0)
+        quality = max(0.0, min(1.0, quality))  # Clamp to [0, 1] 
         
         track = None
         
@@ -381,15 +453,16 @@ def handle_event(data, message_id=None):
                         # Track has multiple appearance modes
                         pass  # Could log this for analysis
                     
-                    # Periodic statistics logging (every 100 updates)
-                    if nested_learning.stats['updates'] % 100 == 0:
-                        print(f"[NestedLearning] Stats: {nested_learning.get_manager_stats()}")
-                        
-                except Exception as e:
-                    print(f"[NestedLearning] Error optimizing track {eid}: {e}")
+                    # Periodic statistics logging
+                    stats = nested_learning.get_manager_stats()
+                    if stats['updates'] % SERVICE_CONFIG.metrics_log_interval == 0:
+                        print(f"[NestedLearning] Stats: {stats}")
+
+                except (ValueError, RuntimeError, AttributeError, TypeError) as e:
+                    print(f"[NestedLearning] Error updating track {gid}: {e}")
             # ====================================================
 
-        elif evt == "TRACK_LOST": 
+        elif evt == "TRACK_LOST":
             tracker.lost_edge_track(cam, eid)
 
         # Logging & Visualization
@@ -397,7 +470,7 @@ def handle_event(data, message_id=None):
             gx, gy = track.kf.smooth_pos
             gid = track.global_id
             ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(data['timestamp']))
-            
+
             if track.is_staff:
                 secret_log.write([ts, group, cam, gid, evt, gx, gy, track.shadow_role, "Unknown"])
             else:
@@ -407,67 +480,140 @@ def handle_event(data, message_id=None):
         viz = tracker.get_viz_data_for_camera(cam)
         if viz:
             r_json.publish(f"results_viz_stream:{cam}", json.dumps(viz))
-        
+
         return True
-        
-    except Exception as e: 
-        print(f"[Handler] Error processing {message_id}: {e}")
+
+    except KeyError as e:
+        print(f"[Handler] Missing required field in message {message_id}: {e}")
+        return False
+    except (ValueError, TypeError) as e:
+        print(f"[Handler] Invalid data in message {message_id}: {e}")
+        return False
+    except Exception as e:
+        print(f"[Handler] Unexpected error processing {message_id}: {e}")
         import traceback
         traceback.print_exc()
         return False
 
 
 # ============================================
+# Dead Letter Queue Processor
+# ============================================
+def process_dlq():
+    """Process dead letter queue messages (monitoring thread)."""
+    print("[DLQ] Processor starting...")
+    dlq_count = 0
+
+    while not shutdown_flag.is_set():
+        try:
+            messages = r_json.xread(
+                {SERVICE_CONFIG.dead_letter_stream: '0'},
+                count=10,
+                block=5000
+            )
+
+            if messages:
+                for stream_name, msgs in messages:
+                    for msg_id, data in msgs:
+                        dlq_count += 1
+                        print(f"[DLQ] Failed message #{dlq_count}: {data}")
+                        # Could send alert, log to file, etc.
+        except redis.ConnectionError:
+            time.sleep(5)
+        except Exception as e:
+            print(f"[DLQ] Error: {e}")
+
+        time.sleep(60)  # Check every minute
+
+# ============================================
 # Stream Consumer Loop
 # ============================================
 def process_stream():
     """Main processing loop using Redis Streams."""
-    print(f"[Stream] Consumer '{CONSUMER_NAME}' starting...")
+    consumer_name = SERVICE_CONFIG.get_consumer_name()
+    print(f"[Stream] Consumer '{consumer_name}' starting...")
+
+    # FIXED: Memory leak prevention - periodic cleanup
     retry_counts = {}
+    retry_timestamps = {}  # Track when retry was added
     last_cache_cleanup = time.time()
+    last_retry_cleanup = time.time()
     
     while True:
         try:
+            current_time = time.time()
+
             # Periodic cache cleanup
-            if time.time() - last_cache_cleanup > 60.0:
+            if current_time - last_cache_cleanup > SERVICE_CONFIG.cache_cleanup_interval:
                 nested_learning.cleanup_cache()
-                last_cache_cleanup = time.time()
-            
+                last_cache_cleanup = current_time
+
+            # FIXED: Periodic retry_counts cleanup (prevent memory leak)
+            if current_time - last_retry_cleanup > SERVICE_CONFIG.retry_cleanup_interval:
+                old_retries = {
+                    k: v for k, v in retry_counts.items()
+                    if current_time - retry_timestamps.get(k, current_time) < 3600
+                }
+                removed = len(retry_counts) - len(old_retries)
+                retry_counts = old_retries
+                retry_timestamps = {k: v for k, v in retry_timestamps.items() if k in old_retries}
+                if removed > 0:
+                    print(f"[Stream] Cleaned up {removed} old retry entries")
+                last_retry_cleanup = current_time
+
             # Read messages
             messages = r_json.xreadgroup(
-                groupname=CONSUMER_GROUP,
-                consumername=CONSUMER_NAME,
-                streams={STREAM_NAME: '>'},
-                count=BATCH_SIZE,
-                block=BLOCK_MS
+                groupname=SERVICE_CONFIG.consumer_group,
+                consumername=consumer_name,
+                streams={SERVICE_CONFIG.stream_name: '>'},
+                count=SERVICE_CONFIG.batch_size,
+                block=SERVICE_CONFIG.block_ms
             )
             
             if not messages:
                 # Handle pending/failed messages
                 pending = r_json.xpending_range(
-                    STREAM_NAME, CONSUMER_GROUP,
+                    SERVICE_CONFIG.stream_name,
+                    SERVICE_CONFIG.consumer_group,
                     min='-', max='+', count=10
                 )
                 for p in pending:
                     msg_id = p['message_id']
-                    if p['time_since_delivered'] > 30000: # 30s timeout
+                    if p['time_since_delivered'] > SERVICE_CONFIG.message_timeout_ms:
                         claimed = r_json.xclaim(
-                            STREAM_NAME, CONSUMER_GROUP, CONSUMER_NAME,
-                            min_idle_time=30000, message_ids=[msg_id]
+                            SERVICE_CONFIG.stream_name,
+                            SERVICE_CONFIG.consumer_group,
+                            consumer_name,
+                            min_idle_time=SERVICE_CONFIG.message_timeout_ms,
+                            message_ids=[msg_id]
                         )
                         for cid, cdata in claimed:
+                            # FIXED: Track timestamp for cleanup
                             retry_counts[cid] = retry_counts.get(cid, 0) + 1
-                            if retry_counts[cid] > MAX_RETRIES:
-                                r_json.xadd(DEAD_LETTER_STREAM, {
-                                    'original_id': cid, 
-                                    'data': cdata.get('data', '{}'), 
-                                    'error': 'max_retries'
+                            retry_timestamps[cid] = current_time
+
+                            if retry_counts[cid] > SERVICE_CONFIG.max_retries:
+                                r_json.xadd(SERVICE_CONFIG.dead_letter_stream, {
+                                    'original_id': cid,
+                                    'data': cdata.get('data', '{}'),
+                                    'error': 'max_retries',
+                                    'retry_count': retry_counts[cid]
                                 })
-                                r_json.xack(STREAM_NAME, CONSUMER_GROUP, cid)
+                                r_json.xack(SERVICE_CONFIG.stream_name, SERVICE_CONFIG.consumer_group, cid)
+                                # Clean up from retry tracking
+                                retry_counts.pop(cid, None)
+                                retry_timestamps.pop(cid, None)
                             else:
-                                data = json.loads(cdata.get('data', '{}'))
-                                if handle_event(data, cid):
-                                    r_json.xack(STREAM_NAME, CONSUMER_GROUP, cid)
+                                try:
+                                    data = json.loads(cdata.get('data', '{}'))
+                                    if handle_event(data, cid):
+                                        r_json.xack(SERVICE_CONFIG.stream_name, SERVICE_CONFIG.consumer_group, cid)
+                                        retry_counts.pop(cid, None)
+                                        retry_timestamps.pop(cid, None)
+                                except json.JSONDecodeError:
+                                    r_json.xack(SERVICE_CONFIG.stream_name, SERVICE_CONFIG.consumer_group, cid)
+                                    retry_counts.pop(cid, None)
+                                    retry_timestamps.pop(cid, None)
                 continue
             
             # Process new messages
@@ -476,15 +622,22 @@ def process_stream():
                     try:
                         data_str = message_data.get('data', '{}')
                         data = json.loads(data_str)
-                        
+
                         if handle_event(data, message_id):
-                            r_json.xack(STREAM_NAME, CONSUMER_GROUP, message_id)
-                    except json.JSONDecodeError:
-                        r_json.xack(STREAM_NAME, CONSUMER_GROUP, message_id)
-                        
+                            r_json.xack(SERVICE_CONFIG.stream_name, SERVICE_CONFIG.consumer_group, message_id)
+                    except json.JSONDecodeError as e:
+                        print(f"[Stream] Invalid JSON in message {message_id}: {e}")
+                        r_json.xack(SERVICE_CONFIG.stream_name, SERVICE_CONFIG.consumer_group, message_id)
+
         except redis.ConnectionError as e:
-            print(f"[Stream] Redis error: {e}")
+            print(f"[Stream] Redis connection error: {e}")
             time.sleep(5)
+        except redis.RedisError as e:
+            print(f"[Stream] Redis error: {e}")
+            time.sleep(2)
+        except KeyboardInterrupt:
+            print("[Stream] Shutdown requested")
+            break
         except Exception as e:
             print(f"[Stream] Unexpected error: {e}")
             import traceback
@@ -492,14 +645,18 @@ def process_stream():
             time.sleep(1)
 
 def process_pubsub_legacy():
+    """Legacy pub/sub mode (for backward compatibility)."""
     print("[Legacy] Using Pub/Sub mode")
     pubsub = r_json.pubsub()
     pubsub.subscribe("track_event_stream")
+
     for msg in pubsub.listen():
         if msg['type'] == 'message':
             try:
                 data = json.loads(msg['data'])
                 handle_event(data)
+            except json.JSONDecodeError as e:
+                print(f"[Legacy] Invalid JSON: {e}")
             except Exception as e:
                 print(f"[Legacy] Error: {e}")
 
@@ -524,27 +681,38 @@ signal.signal(signal.SIGTERM, signal_handler)
 
 if __name__ == "__main__":
     import argparse
-    
-    parser = argparse.ArgumentParser(description='MCT Central Tracker Service (Enhanced)')
-    parser.add_argument('--mode', choices=['stream', 'pubsub', 'bridge'], 
+
+    parser = argparse.ArgumentParser(description='MCT Central Tracker Service (Enhanced & Optimized)')
+    parser.add_argument('--mode', choices=['stream', 'pubsub', 'bridge'],
                        default='stream', help='Processing mode')
+    parser.add_argument('--enable-dlq', action='store_true',
+                       help='Enable Dead Letter Queue processor')
     args = parser.parse_args()
-    
+
     print("=" * 60)
-    print("MCT Central Tracker Service - ENHANCED")
+    print("MCT Central Tracker Service - ENHANCED & OPTIMIZED")
     print(f"Mode: {args.mode}")
     print(f"Nested Learning: ContinuumStateV2 (Multi-Modal)")
+    print(f"Thread Safety: ENABLED")
+    print(f"Memory Leak Prevention: ENABLED")
     print("=" * 60)
-    
+
+    # Start DLQ processor if enabled
+    dlq_thread = None
+    if args.enable_dlq and args.mode in ['stream', 'bridge']:
+        dlq_thread = threading.Thread(target=process_dlq, daemon=True, name="DLQ-Processor")
+        dlq_thread.start()
+        print("[DLQ] Processor thread started")
+
     if args.mode == 'stream':
         setup_stream()
         print("[Central] Service Running with Redis Streams...")
         process_stream()
-        
+
     elif args.mode == 'pubsub':
         print("[Central] Service Running with Pub/Sub (legacy)...")
         process_pubsub_legacy()
-        
+
     elif args.mode == 'bridge':
         setup_stream()
         migrate_from_pubsub()
