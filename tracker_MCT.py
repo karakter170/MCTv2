@@ -143,7 +143,8 @@ class OCSORTTracker:
         if len(self.history_x) >= 7:
             try:
                 self.smooth_pos = np.array([savgol_filter(self.history_x, 7, 2)[-1], savgol_filter(self.history_y, 7, 2)[-1]])
-            except: 
+            except (ValueError, IndexError) as e:
+                # FIXED: Catch specific exceptions, fallback to raw position
                 self.smooth_pos = self.x[:2]
         else:
             self.smooth_pos = self.x[:2]
@@ -290,11 +291,14 @@ class TrackerManagerMCT:
             for gid in active_gids:
                 track = self.global_tracks[gid]
                 # Use Robust ID if available, else Fast ID (last_known_feature)
+                # FIXED: Check if both are None before processing
                 feat = track.robust_id if track.robust_id is not None else track.last_known_feature
-                if feat is not None:
-                    norm_feat = feat / (norm(feat) + 1e-6)
-                    new_vectors.append(norm_feat.astype(np.float32))
-                    new_id_map.append(gid)
+                if feat is None:
+                    continue  # Skip tracks without any feature vector
+
+                norm_feat = feat / (norm(feat) + 1e-6)
+                new_vectors.append(norm_feat.astype(np.float32))
+                new_id_map.append(gid)
             
             self.faiss_index.reset()
             self.faiss_id_map = []
@@ -372,14 +376,15 @@ class TrackerManagerMCT:
         q_vec = q_vec / (norm(q_vec) + 1e-6)
         
         shortlist_k = min(20, self.faiss_index.ntotal)
+        # FIXED: Use snapshot to avoid race condition during FAISS access
         with self._faiss_lock:
             D_raw, I_raw = self.faiss_index.search(q_vec, k=shortlist_k)
             id_map_snapshot = self.faiss_id_map.copy()
-        
+
         candidates = []
         for idx in I_raw[0]:
-            if idx == -1 or idx >= len(self.faiss_id_map): continue
-            cand_gid = self.faiss_id_map[idx]
+            if idx == -1 or idx >= len(id_map_snapshot): continue
+            cand_gid = id_map_snapshot[idx]  # Use snapshot instead of self.faiss_id_map
             cand_track = self.global_tracks.get(cand_gid)
             if cand_track and cand_track.group_id == group_id:
                 candidates.append(cand_track)
@@ -450,17 +455,20 @@ class TrackerManagerMCT:
         
         q_vec = np.array([feature]).astype(np.float32)
         q_vec = q_vec / (norm(q_vec) + 1e-6)
-        
+
         shortlist_k = min(50, self.faiss_index.ntotal)
-        D_raw, I_raw = self.faiss_index.search(q_vec, k=shortlist_k)
-        
+        # FIXED: Add lock for thread-safe FAISS access
+        with self._faiss_lock:
+            D_raw, I_raw = self.faiss_index.search(q_vec, k=shortlist_k)
+            id_map_snapshot = self.faiss_id_map.copy()
+
         best_gid = None
         best_score = 100.0
-        
+
         for idx in I_raw[0]:
-            if idx == -1 or idx >= len(self.faiss_id_map): continue
-            
-            cand_gid = self.faiss_id_map[idx]
+            if idx == -1 or idx >= len(id_map_snapshot): continue
+
+            cand_gid = id_map_snapshot[idx]  # Use snapshot
             track = self.global_tracks.get(cand_gid)
             
             if not track or track.group_id != group_id: continue
@@ -468,10 +476,11 @@ class TrackerManagerMCT:
             
             dt = curr_time - track.last_seen_timestamp
             if dt > self.max_time_gap: continue
-            
+
             # DUAL-QUERY: Compare against both memories
+            # FIXED: Use uncertainty_adjusted_distance for consistency with _fast_match
             dist_fast = cosine_distance_single(q_vec[0], track.last_known_feature)
-            dist_slow = cosine_distance_single(q_vec[0], track.robust_id)
+            dist_slow = uncertainty_adjusted_distance(q_vec[0], track.robust_id, track.robust_var)
             score = min(dist_fast, dist_slow)
             
             if self.topology:
@@ -488,7 +497,8 @@ class TrackerManagerMCT:
                 try:
                     gcn_prob = self.gcn_refiner.predict_score(track, feature, bbox)
                     score = score * 0.7 + (1.0 - gcn_prob) * 0.3
-                except:
+                except (RuntimeError, ValueError, AttributeError) as e:
+                    # FIXED: Catch specific exceptions, GCN refinement is optional
                     pass
             
             if score < self.reid_threshold and score < best_score:
