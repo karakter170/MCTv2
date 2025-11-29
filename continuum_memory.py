@@ -53,7 +53,7 @@ class ContinuumConfig:
     
     # NEW: Learned Gating Settings
     use_learned_gating: bool = True
-    gating_model_path: str = "models/gating_network_msmt17.pt"
+    gating_model_path: str = "models/gating_network_msmt172.pt"
     
     # Learning rates
     alpha_slow_base: float = 0.05

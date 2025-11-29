@@ -220,6 +220,7 @@ class GlobalTrack:
         self.is_staff = False
         self.shadow_role = None
         self.shadow_name = None
+        self.last_cam_res = (1920, 1080)
         
         # --- MEMORY STATES (Dual-Query System) ---
         # Fast Memory: Immediate appearance features
@@ -447,64 +448,157 @@ class TrackerManagerMCT:
         return best_gid, best_score
 
     # ------------------------------------------------------------
-    # MODIFIED: _cross_camera_match with DUAL-QUERY Logic
+    # IMPROVED: _cross_camera_match with BATCH TRANSFORMER
     # ------------------------------------------------------------
-    def _cross_camera_match(self, cam_id, group_id, feature, bbox, gp, curr_time):
+    def _cross_camera_match(self, cam_id, group_id, feature, bbox, gp, curr_time, frame_res):
+        """
+        Optimized matching using Batch Inference for the Transformer.
+        Requires frame dimensions for correct normalization.
+        """
         if self.faiss_index.ntotal == 0:
             return None, 100.0
+        
+        # Unpack current camera resolution
+        frame_w, frame_h = frame_res
         
         q_vec = np.array([feature]).astype(np.float32)
         q_vec = q_vec / (norm(q_vec) + 1e-6)
 
-        shortlist_k = min(50, self.faiss_index.ntotal)
-        # FIXED: Add lock for thread-safe FAISS access
+        # 1. Candidate Retrieval
+        shortlist_k = min(100, self.faiss_index.ntotal)
+        
         with self._faiss_lock:
             D_raw, I_raw = self.faiss_index.search(q_vec, k=shortlist_k)
             id_map_snapshot = self.faiss_id_map.copy()
 
-        best_gid = None
-        best_score = 100.0
-
+        # 2. Pre-filtering & Batch Preparation
+        batch_candidates = []
+        VISUAL_CUTOFF = 0.7 
+        
         for idx in I_raw[0]:
             if idx == -1 or idx >= len(id_map_snapshot): continue
-
-            cand_gid = id_map_snapshot[idx]  # Use snapshot
+            
+            cand_gid = id_map_snapshot[idx]
             track = self.global_tracks.get(cand_gid)
             
+            # Validity Checks
             if not track or track.group_id != group_id: continue
             if track.last_cam_id == cam_id: continue
             
             dt = curr_time - track.last_seen_timestamp
             if dt > self.max_time_gap: continue
 
-            # DUAL-QUERY: Compare against both memories
-            # FIXED: Use uncertainty_adjusted_distance for consistency with _fast_match
+            # Appearance Score
             dist_fast = cosine_distance_single(q_vec[0], track.last_known_feature)
             dist_slow = uncertainty_adjusted_distance(q_vec[0], track.robust_id, track.robust_var)
-            score = min(dist_fast, dist_slow)
+            visual_score = min(dist_fast, dist_slow)
             
+            # Topology & Motion Logic
+            geo_penalty = 1.0
             if self.topology:
                 prob_geo = self.topology.get_transition_prob(group_id, track.last_cam_id, cam_id, dt)
-                if prob_geo < 0.01: continue
-                elif prob_geo < 0.5: score *= 1.2
+                if prob_geo < 0.01: continue 
+                elif prob_geo < 0.5: geo_penalty = 1.2
             
             motion_cost = self._calculate_ocm_cost(track, gp, dt)
             if motion_cost > 0.7: continue
-            elif motion_cost > 0.3: score *= 1.15
+            elif motion_cost > 0.3: geo_penalty *= 1.15
             
-            # GCN Refiner (if available)
-            if score < self.reid_threshold and self.gcn_refiner:
-                try:
-                    gcn_prob = self.gcn_refiner.predict_score(track, feature, bbox)
-                    score = score * 0.7 + (1.0 - gcn_prob) * 0.3
-                except (RuntimeError, ValueError, AttributeError) as e:
-                    # FIXED: Catch specific exceptions, GCN refinement is optional
-                    pass
-            
-            if score < self.reid_threshold and score < best_score:
-                best_score = score
-                best_gid = cand_gid
-        
+            final_visual_score = visual_score * geo_penalty
+
+            # Add to batch if score is reasonable (even if slightly bad visually)
+            if final_visual_score < VISUAL_CUTOFF:
+                batch_candidates.append({
+                    'gid': cand_gid,
+                    'track': track,
+                    'visual_score': final_visual_score
+                })
+
+        # 3. Batch Transformer Refinement
+        best_gid = None
+        best_score = 100.0
+
+        if self.gcn_refiner and batch_candidates:
+            try:
+                # --- STRATEGY: PRE-NORMALIZATION ---
+                # We normalize everything to [0, 1] manually here.
+                # Then we pass 1.0 as resolution to the refiner to bypass its internal normalization.
+                
+                # A. Prepare Query (Current Detection)
+                # Normalize using CURRENT camera resolution
+                norm_q_bbox = [
+                    bbox[0] / frame_w, bbox[1] / frame_h,
+                    bbox[2] / frame_w, bbox[3] / frame_h
+                ]
+
+                # Create Dummy Track for the Query (Refiner expects an object)
+                class DummyTrack:
+                    def __init__(self, feat, box):
+                        self.robust_id = feat
+                        self.last_known_feature = feat
+                        self.last_seen_bbox = box # Pre-normalized
+                        self.last_cam_res = (1.0, 1.0)
+
+                dummy_query = DummyTrack(feature, norm_q_bbox)
+                
+                # B. Prepare Candidates (Past Global Tracks)
+                refiner_candidates = []
+                for item in batch_candidates:
+                    t = item['track']
+                    feat = t.robust_id if t.robust_id is not None else t.last_known_feature
+                    
+                    # Get track's original resolution (fallback to 1920x1080 if missing)
+                    t_w, t_h = getattr(t, 'last_cam_res', (1920, 1080))
+                    
+                    # Normalize track bbox using ITS OWN historical resolution
+                    t_bbox = t.last_seen_bbox
+                    norm_t_bbox = [
+                        t_bbox[0] / t_w, t_bbox[1] / t_h,
+                        t_bbox[2] / t_w, t_bbox[3] / t_h
+                    ]
+                    
+                    refiner_candidates.append({
+                        'feature': feat,
+                        'bbox': norm_t_bbox # Pre-normalized
+                    })
+                
+                # C. Run Batch Inference
+                # Pass frame_w=1.0, frame_h=1.0 because inputs are already normalized [0, 1]
+                refine_scores = self.gcn_refiner.predict_batch(
+                    dummy_query, 
+                    refiner_candidates, 
+                    frame_w=1.0, 
+                    frame_h=1.0
+                )
+                
+                # D. Fuse Scores
+                for i, item in enumerate(batch_candidates):
+                    visual = item['visual_score']
+                    gcn_conf = refine_scores[i] # Higher value = Better Match
+                    gcn_dist = 1.0 - gcn_conf
+                    
+                    # Fusion: 60% Visual, 40% Relation/Geometry
+                    fused_score = visual * 0.6 + gcn_dist * 0.4
+                    
+                    if fused_score < self.reid_threshold and fused_score < best_score:
+                        best_score = fused_score
+                        best_gid = item['gid']
+                        
+            except Exception as e:
+                print(f"[Tracker] Refinement Error: {e}")
+                # Fallback to best visual score if GCN fails
+                for item in batch_candidates:
+                    if item['visual_score'] < best_score:
+                        best_score = item['visual_score']
+                        best_gid = item['gid']
+
+        else:
+            # No refiner available, pick best visual
+            for item in batch_candidates:
+                if item['visual_score'] < best_score:
+                    best_score = item['visual_score']
+                    best_gid = item['gid']
+
         return best_gid, best_score
 
     def update_edge_track_position(self, cam_id, group_id, edge_id, gp, conf, bbox):
@@ -530,7 +624,7 @@ class TrackerManagerMCT:
             self.pending_tracks[map_key]["last_bbox"] = list(bbox) if not isinstance(bbox, list) else bbox
         return None
 
-    def update_edge_track_feature(self, cam_id, group_id, edge_id, gp, conf, bbox, feature, quality_score):
+    def update_edge_track_feature(self, cam_id, group_id, edge_id, gp, conf, bbox, feature, quality_score, frame_res=(1920, 1080)):
         if time.time() - self.last_gc_time > self.gc_interval:
             self._run_garbage_collection()
             self.last_gc_time = time.time()
@@ -544,9 +638,9 @@ class TrackerManagerMCT:
         if existing_gid and existing_gid in self.global_tracks:
             best_gid = existing_gid
         else:
-            best_gid, best_score = self._fast_match(cam_id, group_id, feature, bbox, gp, curr_time)
+            best_gid, best_score = self._fast_match(cam_id, group_id, feature, bbox, gp, curr_time, frame_res)
             if best_gid is None:
-                best_gid, best_score = self._cross_camera_match(cam_id, group_id, feature, bbox, gp, curr_time)
+                best_gid, best_score = self._cross_camera_match(cam_id, group_id, feature, bbox, gp, curr_time, frame_res)
 
         if best_gid:
             gt = self.global_tracks[best_gid]
@@ -585,6 +679,8 @@ class TrackerManagerMCT:
             # --- UPDATE FAST MEMORY ---
             gt.last_known_feature = feature
             # Note: gt.robust_id is NOT updated here; it is updated via Central Service -> Continuum Memory
+
+            gt.last_cam_res = frame_res
             
             self.edge_to_global_map[map_key] = best_gid
             if map_key in self.pending_tracks: del self.pending_tracks[map_key]

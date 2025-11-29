@@ -2,68 +2,83 @@ import torch
 import numpy as np
 from gcn_model_transformer import RelationTransformer 
 
-class GCNHandler:
+class RelationRefiner:  # Renamed from GCNHandler for accuracy
     def __init__(self, weights_path, device='cuda'):
         self.device = device
-        print(f"[GCN] Loading SOTA Transformer from {weights_path}...")
+        print(f"[RelationRefiner] Loading SOTA Transformer from {weights_path}...")
         
-        # Model Mimarisi (Eğitimdeki parametrelerin AYNISI olmalı)
+        # Model Architecture (Must match training)
         self.model = RelationTransformer(feature_dim=1024, geo_dim=4).to(device)
         
-        # Ağırlıkları Yükle
-        checkpoint = torch.load(weights_path, map_location=device)
-        self.model.load_state_dict(checkpoint)
-        self.model.eval() # Inference modu (Dropout/Batchnorm kapanır)
-        print("[GCN] Model Ready.")
-
-    def predict_score(self, track, detection_feat, detection_bbox):
-        """
-        Tek bir Track ile Tek bir Detection arasındaki ilişki skorunu (0-1) döndürür.
-        """
-        # 1. Veri Hazırlığı
-        # Track Feature (1024) + Geo (4)
-        # Try fast memory first, then slow memory
-        t_feat = track.last_known_feature
-        if t_feat is None:
-            t_feat = track.robust_id
-        if t_feat is None:
-            return 0.5  # No features available
-        
-        # Normalize bbox by image dimensions (assume 1920x1080 for now, or pass as param)
-        # Better: normalize to [0,1] range
-        t_bbox = np.array(track.last_seen_bbox, dtype=np.float32)
-        t_geo = np.array([
-            t_bbox[0] / 1920.0,  # x1 normalized
-            t_bbox[1] / 1080.0,  # y1 normalized  
-            t_bbox[2] / 1920.0,  # x2 normalized
-            t_bbox[3] / 1080.0   # y2 normalized
-        ], dtype=np.float32)
-        
-        d_bbox = np.array(detection_bbox, dtype=np.float32)
-        d_geo = np.array([
-            d_bbox[0] / 1920.0,
-            d_bbox[1] / 1080.0,
-            d_bbox[2] / 1920.0,
-            d_bbox[3] / 1080.0
-        ], dtype=np.float32)
-        
-        # Concat: (1024 + 4) = 1028
-        t_input = np.concatenate([t_feat, t_geo])
-        d_input = np.concatenate([detection_feat, d_geo])
-        
-        # 2. Create tensors with CORRECT shape for the model
-        # Model expects: (Batch, Dim, N) -> transposes internally to (Batch, N, Dim)
-        # So we need: (1, 1028, 1) - Batch=1, Dim=1028, N=1
-        
-        t_tensor = torch.tensor(t_input, dtype=torch.float32).to(self.device)
-        t_tensor = t_tensor.unsqueeze(0).unsqueeze(-1)  # (1028,) -> (1, 1028, 1) ✓
-
-        d_tensor = torch.tensor(d_input, dtype=torch.float32).to(self.device)
-        d_tensor = d_tensor.unsqueeze(0).unsqueeze(-1)  # (1028,) -> (1, 1028, 1) ✓
-        
-        # 3. Inference
-        with torch.no_grad():
-            logits = self.model(t_tensor, d_tensor)
-            score = torch.sigmoid(logits).item()
+        try:
+            checkpoint = torch.load(weights_path, map_location=device)
+            self.model.load_state_dict(checkpoint)
+        except Exception as e:
+            print(f"[RelationRefiner] Warning: Could not load weights: {e}")
             
-        return score
+        self.model.eval()
+        print("[RelationRefiner] Model Ready (Batch Mode Enabled).")
+
+    def _normalize_bbox(self, bbox, w, h):
+        """Normalize bbox to [0, 1] range."""
+        return np.array([
+            bbox[0] / w, bbox[1] / h,
+            bbox[2] / w, bbox[3] / h
+        ], dtype=np.float32)
+
+    def predict_batch(self, track, candidates, frame_w, frame_h):
+        """
+        Batch Inference: Compare 1 Track against N Candidates.
+        
+        Args:
+            track: The GlobalTrack object (Query)
+            candidates: List of dicts/objects with 'feature' and 'bbox' (Keys)
+            frame_w, frame_h: Dimensions of the current camera frame
+        
+        Returns:
+            scores: Numpy array of shape (N,) with similarity probabilities.
+        """
+        if not candidates:
+            return np.array([])
+
+        # 1. Prepare Track Data (Query)
+        # Use robust ID (Slow Memory) if available, else Fast Memory
+        t_feat = track.robust_id if track.robust_id is not None else track.last_known_feature
+        if t_feat is None: return np.zeros(len(candidates))
+        
+        t_bbox = track.last_seen_bbox
+        # Note: Track bbox is from a previous camera/time. 
+        # Ideally, we should normalize it by *that* camera's resolution.
+        # For now, we assume standard normalization or similar aspect ratios.
+        t_geo = self._normalize_bbox(t_bbox, 1920, 1080) # Fallback if prev cam res unknown
+        
+        t_input = np.concatenate([t_feat, t_geo])
+        
+        # 2. Prepare Candidates Data (Keys)
+        d_inputs = []
+        for cand in candidates:
+            d_feat = cand['feature']
+            d_geo = self._normalize_bbox(cand['bbox'], frame_w, frame_h)
+            d_inputs.append(np.concatenate([d_feat, d_geo]))
+            
+        # 3. Batch Tensor Creation
+        # Shape: (1, 1028, 1) -> Batch=1, Dim=1028, N=1 Track
+        t_tensor = torch.tensor(t_input, dtype=torch.float32).to(self.device)
+        t_tensor = t_tensor.unsqueeze(0).unsqueeze(-1) 
+
+        # Shape: (1, 1028, M) -> Batch=1, Dim=1028, M Candidates
+        d_stack = np.stack(d_inputs, axis=1) # (1028, M)
+        d_tensor = torch.tensor(d_stack, dtype=torch.float32).to(self.device)
+        d_tensor = d_tensor.unsqueeze(0) 
+
+        # 4. Inference
+        with torch.no_grad():
+            # The model handles broadcasting internally via .expand()
+            logits = self.model(t_tensor, d_tensor) # Output: (1, 1, M)
+            scores = torch.sigmoid(logits).squeeze().cpu().numpy()
+            
+        # Handle single candidate case returning scalar
+        if scores.ndim == 0:
+            scores = np.array([scores])
+            
+        return scores

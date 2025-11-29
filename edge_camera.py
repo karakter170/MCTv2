@@ -239,6 +239,7 @@ def send_track_event(event_type, edge_id, gp=None, bbox=None, feat=None, conf=No
         "bbox": bbox.tolist() if isinstance(bbox, np.ndarray) else (list(bbox) if bbox else None),
         "feature": feat.tolist() if isinstance(feat, np.ndarray) else feat,
         "conf": float(conf) if conf is not None else None, 
+        "frame_res": [frame_w, frame_h],
         "quality": float(quality)
     }
     
