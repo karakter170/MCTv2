@@ -22,9 +22,12 @@ class GCNHandler:
         """
         # 1. Veri Hazırlığı
         # Track Feature (1024) + Geo (4)
+        # Try fast memory first, then slow memory
         t_feat = track.last_known_feature
         if t_feat is None:
-            return 0.5  # No feature available, return neutral score
+            t_feat = track.robust_id
+        if t_feat is None:
+            return 0.5  # No features available
         
         # Normalize bbox by image dimensions (assume 1920x1080 for now, or pass as param)
         # Better: normalize to [0,1] range

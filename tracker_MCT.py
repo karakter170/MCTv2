@@ -5,6 +5,7 @@
 # 1. Implemented Dual-Query (Fast vs Slow) matching in _fast_match and _cross_camera_match.
 # 2. Added 'robust_id' attribute to GlobalTrack for Slow Memory storage.
 # 3. Helper function 'cosine_distance_single' added for point-to-point comparison.
+# 4. BUGFIX: Added missing 'last_known_feature' attribute to GlobalTrack.__init__
 
 import numpy as np
 from scipy.signal import savgol_filter 
@@ -14,6 +15,7 @@ import time
 import faiss 
 from datetime import datetime 
 from staff_filter import StaffFilter
+import threading
 
 try:
     from gcn_handler import GCNHandler
@@ -187,17 +189,45 @@ def uncertainty_adjusted_distance(query, target_mean, target_var):
 
 
 class GlobalTrack:
-    def __init__(self, global_id, group_id, dt, initial_state, initial_P, Q_cov, R_cov):
-        self.global_id = global_id; self.group_id = group_id
-        self.kf = OCSORTTracker(dt, initial_state, initial_P, Q_cov, R_cov)
-        self.last_cam_id = None; self.last_seen_bbox = [0,0,0,0] 
-        self.last_seen_timestamp = time.time()
-        self.is_staff = False; self.shadow_role = None; self.shadow_name = None 
+    """
+    Represents a globally tracked identity across multiple cameras.
+    
+    Attributes:
+        global_id: Unique identifier for this track
+        group_id: Group/location identifier (e.g., "mall_1")
+        kf: Kalman filter for position estimation
+        last_cam_id: Last camera where this track was seen
+        last_seen_bbox: Last bounding box coordinates [x1, y1, x2, y2]
+        last_seen_timestamp: Unix timestamp of last observation
+        is_staff: Whether this track is identified as staff
+        shadow_role: Staff role if is_staff is True
+        shadow_name: Staff name if is_staff is True
         
-        # --- MEMORY STATES ---
-        self.fast_buffer = []  # Fast Memory (Immediate appearance)
-        self.robust_id = None           # Slow Memory (Stable identity from CMS)
-        self.robust_var = None   # Variance (Uncertainty)
+        # Memory States (Dual-Query System):
+        last_known_feature: Most recent feature vector (Fast Memory - immediate)
+        fast_buffer: List of recent features for robust matching
+        robust_id: Slow Memory mean vector (stable identity from ContinuumState)
+        robust_var: Slow Memory variance (uncertainty estimation)
+    """
+    def __init__(self, global_id, group_id, dt, initial_state, initial_P, Q_cov, R_cov):
+        self.global_id = global_id
+        self.group_id = group_id
+        self.kf = OCSORTTracker(dt, initial_state, initial_P, Q_cov, R_cov)
+        self.last_cam_id = None
+        self.last_seen_bbox = [0, 0, 0, 0]
+        self.last_seen_timestamp = time.time()
+        self.is_staff = False
+        self.shadow_role = None
+        self.shadow_name = None
+        
+        # --- MEMORY STATES (Dual-Query System) ---
+        # Fast Memory: Immediate appearance features
+        self.last_known_feature = None  # BUGFIX: This was missing!
+        self.fast_buffer = []           # Buffer of recent features for matching
+        
+        # Slow Memory: Stable identity from Continuum Memory System
+        self.robust_id = None           # Mean vector (consolidated identity)
+        self.robust_var = None          # Variance vector (uncertainty)
 
 
 class TrackerManagerMCT:
@@ -221,6 +251,8 @@ class TrackerManagerMCT:
         self.rerank_cache_ttl = 5.0
         
         self.min_features_for_id = 3
+
+        self._faiss_lock = threading.RLock()
         
         self.gcn_refiner = None
         if GCN_AVAILABLE:
@@ -239,14 +271,15 @@ class TrackerManagerMCT:
         return self.staff_filters[group_id]
 
     def _run_garbage_collection(self):
-        curr_time = time.time()
-        expired = [gid for gid, t in self.global_tracks.items() if (curr_time - t.last_seen_timestamp) > self.max_keep_alive]
-        if expired:
-            print(f"[GC] Removing {len(expired)} expired tracks.")
-            for gid in expired:
-                del self.global_tracks[gid]
-                keys_to_del = [k for k, v in self.edge_to_global_map.items() if v == gid]
-                for k in keys_to_del: del self.edge_to_global_map[k]
+        with self._faiss_lock:
+            curr_time = time.time()
+            expired = [gid for gid, t in self.global_tracks.items() if (curr_time - t.last_seen_timestamp) > self.max_keep_alive]
+            if expired:
+                print(f"[GC] Removing {len(expired)} expired tracks.")
+                for gid in expired:
+                    del self.global_tracks[gid]
+                    keys_to_del = [k for k, v in self.edge_to_global_map.items() if v == gid]
+                    for k in keys_to_del: del self.edge_to_global_map[k]
         
         if self.faiss_index.ntotal > self.max_faiss_size:
             print("[GC] Rebuilding FAISS Index...")
@@ -256,7 +289,7 @@ class TrackerManagerMCT:
             
             for gid in active_gids:
                 track = self.global_tracks[gid]
-                # Use Robust ID if available, else Fast ID
+                # Use Robust ID if available, else Fast ID (last_known_feature)
                 feat = track.robust_id if track.robust_id is not None else track.last_known_feature
                 if feat is not None:
                     norm_feat = feat / (norm(feat) + 1e-6)
@@ -339,7 +372,9 @@ class TrackerManagerMCT:
         q_vec = q_vec / (norm(q_vec) + 1e-6)
         
         shortlist_k = min(20, self.faiss_index.ntotal)
-        D_raw, I_raw = self.faiss_index.search(q_vec, k=shortlist_k)
+        with self._faiss_lock:
+            D_raw, I_raw = self.faiss_index.search(q_vec, k=shortlist_k)
+            id_map_snapshot = self.faiss_id_map.copy()
         
         candidates = []
         for idx in I_raw[0]:
@@ -363,7 +398,9 @@ class TrackerManagerMCT:
                 dists = [cosine_distance_single(q_vec[0], f) for f in track.fast_buffer]
                 dist_fast = min(dists) # Take the best angle
             else:
-                dist_fast = 2.0
+                # Fallback to last_known_feature if buffer is empty
+                dist_fast = cosine_distance_single(q_vec[0], track.last_known_feature)
+            
             dist_slow = uncertainty_adjusted_distance(
                 q_vec[0], 
                 track.robust_id, 
@@ -526,6 +563,7 @@ class TrackerManagerMCT:
                     ratio = (h_curr - h_last) / h_last
                     if ratio < -0.25 or ratio > 0.40: is_bad_quality_box = True
             
+            # Update Fast Buffer
             gt.fast_buffer.append(feature)
             if len(gt.fast_buffer) > 5: # Keep last 5
                 gt.fast_buffer.pop(0)
@@ -534,7 +572,7 @@ class TrackerManagerMCT:
             gt.last_seen_timestamp = curr_time
             gt.last_cam_id = cam_id
             
-            # --- UPDATE FAST MEMORY ONLY ---
+            # --- UPDATE FAST MEMORY ---
             gt.last_known_feature = feature
             # Note: gt.robust_id is NOT updated here; it is updated via Central Service -> Continuum Memory
             
