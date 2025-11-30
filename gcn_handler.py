@@ -29,54 +29,59 @@ class RelationRefiner:  # Renamed from GCNHandler for accuracy
     def predict_batch(self, track, candidates, frame_w, frame_h, curr_time):
         """
         Batch Inference: Compare 1 Track against N Candidates.
-        
+
         Args:
             track: The GlobalTrack object (Query)
             candidates: List of dicts/objects with 'feature' and 'bbox' (Keys)
             frame_w, frame_h: Dimensions of the current camera frame
-        
+            curr_time: Current timestamp for temporal features
+
         Returns:
             scores: Numpy array of shape (N,) with similarity probabilities.
         """
         if not candidates:
             return np.array([])
-        
-        dt = curr_time - track.last_seen_timestamp
-
-        norm_dt = np.tanh(dt / 10.0)
-
-        t_geo = np.concatenate([
-            self._normalize_bbox(track.last_seen_bbox, 1920, 1080), 
-            [norm_dt]
-        ])
 
         # 1. Prepare Track Data (Query)
         # Use robust ID (Slow Memory) if available, else Fast Memory
         t_feat = track.robust_id if track.robust_id is not None else track.last_known_feature
         if t_feat is None: return np.zeros(len(candidates))
-        
-        t_bbox = track.last_seen_bbox
-        # Note: Track bbox is from a previous camera/time. 
-        # Ideally, we should normalize it by *that* camera's resolution.
-        # For now, we assume standard normalization or similar aspect ratios.
-        t_geo = self._normalize_bbox(t_bbox, 1920, 1080) # Fallback if prev cam res unknown
-        
+
+        # Get track's camera resolution (use stored value or fallback)
+        t_w, t_h = getattr(track, 'last_cam_res', (1920, 1080))
+
+        # Normalize track bbox using its original camera resolution
+        t_bbox_norm = self._normalize_bbox(track.last_seen_bbox, t_w, t_h)
+
+        # Calculate normalized time gap
+        dt = curr_time - track.last_seen_timestamp
+        norm_dt = np.tanh(dt / 10.0)  # Squash to [-1, 1] range
+
+        # FIXED: Create 5D geometry vector (4 bbox + 1 time)
+        t_geo = np.concatenate([t_bbox_norm, [norm_dt]])
+
+        # Combine features: 1024 (appearance) + 5 (geometry+time) = 1029 dimensions
         t_input = np.concatenate([t_feat, t_geo])
         
         # 2. Prepare Candidates Data (Keys)
         d_inputs = []
         for cand in candidates:
             d_feat = cand['feature']
-            d_geo = self._normalize_bbox(cand['bbox'], frame_w, frame_h)
-            d_inputs.append(np.concatenate([d_feat, d_geo]))
-            
-        # 3. Batch Tensor Creation
-        # Shape: (1, 1028, 1) -> Batch=1, Dim=1028, N=1 Track
-        t_tensor = torch.tensor(t_input, dtype=torch.float32).to(self.device)
-        t_tensor = t_tensor.unsqueeze(0).unsqueeze(-1) 
+            d_bbox_norm = self._normalize_bbox(cand['bbox'], frame_w, frame_h)
 
-        # Shape: (1, 1028, M) -> Batch=1, Dim=1028, M Candidates
-        d_stack = np.stack(d_inputs, axis=1) # (1028, M)
+            # Candidates are current detections, so dt=0
+            # FIXED: Add time dimension (5D geometry: 4 bbox + 1 time)
+            d_geo = np.concatenate([d_bbox_norm, [0.0]])
+
+            d_inputs.append(np.concatenate([d_feat, d_geo]))
+
+        # 3. Batch Tensor Creation
+        # Shape: (1, 1029, 1) -> Batch=1, Dim=1029 (1024 feat + 5 geo), N=1 Track
+        t_tensor = torch.tensor(t_input, dtype=torch.float32).to(self.device)
+        t_tensor = t_tensor.unsqueeze(0).unsqueeze(-1)
+
+        # Shape: (1, 1029, M) -> Batch=1, Dim=1029, M Candidates
+        d_stack = np.stack(d_inputs, axis=1)  # (1029, M)
         d_tensor = torch.tensor(d_stack, dtype=torch.float32).to(self.device)
         d_tensor = d_tensor.unsqueeze(0) 
 
