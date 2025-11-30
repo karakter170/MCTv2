@@ -533,13 +533,14 @@ class TrackerManagerMCT:
 
                 # Create Dummy Track for the Query (Refiner expects an object)
                 class DummyTrack:
-                    def __init__(self, feat, box):
+                    def __init__(self, feat, box, timestamp):
                         self.robust_id = feat
                         self.last_known_feature = feat
                         self.last_seen_bbox = box # Pre-normalized
                         self.last_cam_res = (1.0, 1.0)
+                        self.last_seen_timestamp = timestamp  # BUGFIX: Required by gcn_handler
 
-                dummy_query = DummyTrack(feature, norm_q_bbox)
+                dummy_query = DummyTrack(feature, norm_q_bbox, curr_time)
                 
                 # B. Prepare Candidates (Past Global Tracks)
                 refiner_candidates = []
