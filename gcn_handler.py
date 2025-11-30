@@ -1,14 +1,15 @@
 import torch
 import numpy as np
-from gcn_model_transformer import RelationTransformer 
+from gcn_model_sota import CrossGCN  # FIXED: Use CrossGCN to match training
 
 class RelationRefiner:  # Renamed from GCNHandler for accuracy
     def __init__(self, weights_path, device='cuda'):
         self.device = device
-        print(f"[RelationRefiner] Loading SOTA Transformer from {weights_path}...")
-        
+        print(f"[RelationRefiner] Loading SOTA CrossGCN from {weights_path}...")
+
         # Model Architecture (Must match training)
-        self.model = RelationTransformer(feature_dim=1024, geo_dim=4).to(device)
+        # FIXED: Use CrossGCN with feature_dim=1029 (1024 appearance + 5 geometry+time)
+        self.model = CrossGCN(feature_dim=1029).to(device)
         
         try:
             checkpoint = torch.load(weights_path, map_location=device)
@@ -20,11 +21,14 @@ class RelationRefiner:  # Renamed from GCNHandler for accuracy
         print("[RelationRefiner] Model Ready (Batch Mode Enabled).")
 
     def _normalize_bbox(self, bbox, w, h):
-        """Normalize bbox to [0, 1] range."""
-        return np.array([
+        """Normalize bbox to [-1, 1] range to match training."""
+        # First normalize to [0, 1]
+        norm_01 = np.array([
             bbox[0] / w, bbox[1] / h,
             bbox[2] / w, bbox[3] / h
         ], dtype=np.float32)
+        # Then scale to [-1, 1] to match DINOv3 feature range
+        return (norm_01 - 0.5) * 2.0
 
     def predict_batch(self, track, candidates, frame_w, frame_h, curr_time):
         """
@@ -64,8 +68,9 @@ class RelationRefiner:  # Renamed from GCNHandler for accuracy
         dt = curr_time - track.last_seen_timestamp
         norm_dt = np.tanh(dt / 10.0)  # Squash to [-1, 1] range
 
-        # FIXED: Create 5D geometry vector (4 bbox + 1 time)
-        t_geo = np.concatenate([t_bbox_norm, [norm_dt]])
+        # FIXED: Use symmetric time encoding to match training
+        # Track (earlier) gets -norm_dt/2, Detection (later) gets +norm_dt/2
+        t_geo = np.concatenate([t_bbox_norm, [-norm_dt/2]])
 
         # Combine features: 1024 (appearance) + 5 (geometry+time) = 1029 dimensions
         t_input = np.concatenate([t_feat, t_geo])
@@ -83,9 +88,9 @@ class RelationRefiner:  # Renamed from GCNHandler for accuracy
 
             d_bbox_norm = self._normalize_bbox(cand['bbox'], frame_w, frame_h)
 
-            # Candidates are current detections, so dt=0
-            # FIXED: Add time dimension (5D geometry: 4 bbox + 1 time)
-            d_geo = np.concatenate([d_bbox_norm, [0.0]])
+            # FIXED: Symmetric time encoding to match training
+            # Candidates (current/later) get +norm_dt/2
+            d_geo = np.concatenate([d_bbox_norm, [+norm_dt/2]])
 
             d_inputs.append(np.concatenate([d_feat, d_geo]))
 
