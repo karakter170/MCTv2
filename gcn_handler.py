@@ -45,7 +45,14 @@ class RelationRefiner:  # Renamed from GCNHandler for accuracy
         # 1. Prepare Track Data (Query)
         # Use robust ID (Slow Memory) if available, else Fast Memory
         t_feat = track.robust_id if track.robust_id is not None else track.last_known_feature
-        if t_feat is None: return np.zeros(len(candidates))
+        if t_feat is None:
+            return np.zeros(len(candidates))
+
+        # BUGFIX: Validate and enforce feature normalization
+        feat_norm = np.linalg.norm(t_feat)
+        if abs(feat_norm - 1.0) > 0.1:  # Allow small numerical errors
+            print(f"[GCN] WARNING: Track feature not normalized (||f||={feat_norm:.4f}), fixing...")
+            t_feat = t_feat / (feat_norm + 1e-8)
 
         # Get track's camera resolution (use stored value or fallback)
         t_w, t_h = getattr(track, 'last_cam_res', (1920, 1080))
@@ -67,6 +74,13 @@ class RelationRefiner:  # Renamed from GCNHandler for accuracy
         d_inputs = []
         for cand in candidates:
             d_feat = cand['feature']
+
+            # BUGFIX: Validate and enforce feature normalization for candidates
+            feat_norm = np.linalg.norm(d_feat)
+            if abs(feat_norm - 1.0) > 0.1:
+                print(f"[GCN] WARNING: Candidate feature not normalized (||f||={feat_norm:.4f}), fixing...")
+                d_feat = d_feat / (feat_norm + 1e-8)
+
             d_bbox_norm = self._normalize_bbox(cand['bbox'], frame_w, frame_h)
 
             # Candidates are current detections, so dt=0
