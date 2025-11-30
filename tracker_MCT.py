@@ -259,7 +259,7 @@ class TrackerManagerMCT:
         self.gcn_refiner = None
         if GCN_AVAILABLE:
             try:
-                self.gcn_refiner = GCNHandler("models/sota_gcn_dinov3_5dim.pth")
+                self.gcn_refiner = GCNHandler("models/sota_gcn_dinov3_5_2dim.pth")
                 print("[Central] GCN Refiner Loaded.")
             except Exception as e:
                 print(f"[Central] GCN Load Failed: {e}")

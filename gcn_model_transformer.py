@@ -39,15 +39,15 @@ class RelationTransformer(nn.Module):
 
     def forward(self, tracks, detections):
         """
-        tracks: (Batch, 1029, N)
-        detections: (Batch, 1029, M)
+        tracks: (Batch, 1028, N)
+        detections: (Batch, 1028, M)
         """
         # (B, Dim, N) -> (B, N, Dim)
         tracks = tracks.transpose(1, 2)
         detections = detections.transpose(1, 2)
-
+        
         # --- Split Features & Geometry ---
-        # Input: 1029 dim = 1024 (DINO) + 5 (4 bbox + 1 time)
+        # Giriş 1028 dim: İlk 1024 DINO, Son 4 Geo
         t_app, t_geo = tracks[:, :, :1024], tracks[:, :, 1024:]
         d_app, d_geo = detections[:, :, :1024], detections[:, :, 1024:]
         
