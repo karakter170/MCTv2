@@ -770,7 +770,15 @@ class LearnedGating:
             try:
                 self.model = GatingNetwork()
                 checkpoint = torch.load(model_path, map_location=self.device)
-                self.model.load_state_dict(checkpoint['model_state_dict'])
+
+                # Handle both formats: wrapped dict or direct state_dict
+                if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                    # Format: {'model_state_dict': ..., 'optimizer_state_dict': ...}
+                    self.model.load_state_dict(checkpoint['model_state_dict'])
+                else:
+                    # Format: Direct state_dict (from torch.save(model.state_dict(), path))
+                    self.model.load_state_dict(checkpoint)
+
                 self.model.to(self.device)
                 self.model.eval()
                 print(f"[LearnedGating] Model loaded from {model_path}")
