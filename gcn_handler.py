@@ -26,7 +26,7 @@ class RelationRefiner:  # Renamed from GCNHandler for accuracy
             bbox[2] / w, bbox[3] / h
         ], dtype=np.float32)
 
-    def predict_batch(self, track, candidates, frame_w, frame_h):
+    def predict_batch(self, track, candidates, frame_w, frame_h, curr_time):
         """
         Batch Inference: Compare 1 Track against N Candidates.
         
@@ -40,6 +40,15 @@ class RelationRefiner:  # Renamed from GCNHandler for accuracy
         """
         if not candidates:
             return np.array([])
+        
+        dt = curr_time - track.last_seen_timestamp
+
+        norm_dt = np.tanh(dt / 10.0)
+
+        t_geo = np.concatenate([
+            self._normalize_bbox(track.last_seen_bbox, 1920, 1080), 
+            [norm_dt]
+        ])
 
         # 1. Prepare Track Data (Query)
         # Use robust ID (Slow Memory) if available, else Fast Memory

@@ -131,7 +131,7 @@ class ThreadSafeTracklets:
 
 # --- SETTINGS ---
 CAMERA_ID = "cam_01_ist"
-VIDEO_SOURCE = "./videolar/videom.mp4"
+VIDEO_SOURCE = "./videolar/videom5.mp4"
 #VIDEO_SOURCE = 0 
 GROUP_ID = "istanbul_avm"
 HOMOGRAPHY_PATH = "h_cam_01_ist.npy"

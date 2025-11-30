@@ -259,7 +259,7 @@ class TrackerManagerMCT:
         self.gcn_refiner = None
         if GCN_AVAILABLE:
             try:
-                self.gcn_refiner = GCNHandler("models/sota_transformer_dinov3.pth")
+                self.gcn_refiner = GCNHandler("models/sota_gcn_dinov3_5dim.pth")
                 print("[Central] GCN Refiner Loaded.")
             except Exception as e:
                 print(f"[Central] GCN Load Failed: {e}")
@@ -369,7 +369,7 @@ class TrackerManagerMCT:
     # ------------------------------------------------------------
     # MODIFIED: _fast_match with DUAL-QUERY Logic
     # ------------------------------------------------------------
-    def _fast_match(self, cam_id, group_id, feature, bbox, gp, curr_time):
+    def _fast_match(self, cam_id, group_id, feature, bbox, gp, curr_time, frame_res=(1920, 1080)):
         if self.faiss_index.ntotal == 0:
             return None, 100.0
         
@@ -568,7 +568,8 @@ class TrackerManagerMCT:
                     dummy_query, 
                     refiner_candidates, 
                     frame_w=1.0, 
-                    frame_h=1.0
+                    frame_h=1.0,
+                    curr_time=curr_time
                 )
                 
                 # D. Fuse Scores

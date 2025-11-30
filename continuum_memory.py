@@ -226,7 +226,11 @@ class ContinuumStateV2:
         # --- FIX: Ensure these lists are initialized ---
         self.consistency_history = data.get('consistency_history', [])
         self.quality_history = data.get('quality_history', [])
-        # -----------------------------------------------
+        
+        # --- FIX: Initialize missing attributes to prevent AttributeError ---
+        self.breakout_candidate = None
+        self.total_quality_sum = data.get('total_quality_sum', 0.0)
+        # -------------------------------------------------------------------
         
         phase_str = data.get('phase', 'bootstrap')
         try: self.phase = LearningPhase(phase_str)
@@ -245,7 +249,8 @@ class ContinuumStateV2:
             'consistency_ema': self.consistency_ema,
             'consistency_history': self.consistency_history[-50:], # Save last 50
             'quality_history': self.quality_history[-50:], # Save last 50
-            'phase': self.phase.value
+            'phase': self.phase.value,
+            'total_quality_sum': self.total_quality_sum
         }
 
     # =========================================================================

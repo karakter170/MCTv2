@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class RelationTransformer(nn.Module):
-    def __init__(self, feature_dim=1024, geo_dim=4, hidden_dim=256, nhead=4):
+    def __init__(self, feature_dim=1024, geo_dim=5, hidden_dim=256, nhead=4):
         super(RelationTransformer, self).__init__()
         
         # 1. Feature Stream (DINO)
