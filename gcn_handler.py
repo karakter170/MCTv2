@@ -13,7 +13,13 @@ class RelationRefiner:  # Renamed from GCNHandler for accuracy
         
         try:
             checkpoint = torch.load(weights_path, map_location=device)
-            self.model.load_state_dict(checkpoint)
+
+            # Handle both formats: wrapped dict or direct state_dict
+            if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+                self.model.load_state_dict(checkpoint['model_state_dict'])
+            else:
+                # Assume checkpoint IS the state_dict
+                self.model.load_state_dict(checkpoint)
         except Exception as e:
             print(f"[RelationRefiner] Warning: Could not load weights: {e}")
             
